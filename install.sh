@@ -28,30 +28,79 @@ isRoot() {
     [ $(id -u) -eq 0 ] && return 0 || return 1
 }
 
-addUser() {
-    if isRoot; then
-        [ "$username" = "root" ] && return 0
-        if grep -q "^$username:" /etc/passwd; then
-            echo " - Пользователь $username уже существует!"
-            return 0
+# --- НОВОЕ: гарантируем, что есть группа nogroup (gid 65534 типичен для OpenWrt) ---
+ensureNogroup() {
+    if ! grep -q "^nogroup:" /etc/group; then
+        if command -v groupadd >/dev/null 2>&1; then
+            groupadd -g 65534 nogroup 2>/dev/null || groupadd nogroup 2>/dev/null
         else
-            adduser -D -H -h "$dirInstall" -s /bin/false -G nogroup "$username"
-            if [ $? -eq 0 ]; then
-                chmod 755 "$dirInstall"
-                echo " - Пользователь $username добавлен!"
-            else
-                echo " - Не удалось добавить пользователя $username!"
-                return 1
-            fi
+            echo "nogroup:x:65534:" >> /etc/group
         fi
     fi
 }
 
+# --- ИСПРАВЛЕНО: создание пользователя работает без adduser ---
+addUser() {
+    if isRoot; then
+        [ "$username" = "root" ] && return 0
+
+        # если уже есть — ок
+        if grep -q "^$username:" /etc/passwd; then
+            echo " - Пользователь $username уже существует!"
+            return 0
+        fi
+
+        [ -d "$dirInstall" ] || mkdir -p "$dirInstall"
+        ensureNogroup
+
+        echo " - Добавляем пользователя $username..."
+
+        if command -v useradd >/dev/null 2>&1; then
+            useradd -r -s /bin/false -d "$dirInstall" -M -g nogroup "$username"
+        elif command -v adduser >/dev/null 2>&1; then
+            adduser -D -H -h "$dirInstall" -s /bin/false -G nogroup "$username"
+        else
+            # Пытаемся установить shadow-utils и использовать useradd
+            if command -v opkg >/dev/null 2>&1; then
+                echo " - Устанавливаем shadow-utils (shadow-useradd, shadow-groupadd, shadow-usermod)..."
+                opkg update >/dev/null 2>&1
+                opkg install shadow-useradd shadow-groupadd shadow-usermod >/dev/null 2>&1
+            fi
+
+            if command -v useradd >/dev/null 2>&1; then
+                useradd -r -s /bin/false -d "$dirInstall" -M -g nogroup "$username"
+            else
+                # Крайний фолбэк: вручную дописываем в passwd/shadow с корректным UID (>=1000)
+                next_uid=$(awk -F: 'BEGIN{max=999} {if($3>max) max=$3} END{print (max<1000?1000:max+1)}' /etc/passwd)
+                echo "$username:x:${next_uid}:65534:$username:$dirInstall:/bin/false" >> /etc/passwd
+                if ! grep -q "^$username:" /etc/shadow 2>/dev/null; then
+                    echo "$username:!*:0:0:99999:7:::" >> /etc/shadow
+                fi
+            fi
+        fi
+
+        if grep -q "^$username:" /etc/passwd; then
+            chmod 755 "$dirInstall"
+            chown -R "$username:nogroup" "$dirInstall"
+            echo " - Пользователь $username добавлен и назначен владельцем $dirInstall"
+            return 0
+        else
+            echo " - Не удалось добавить пользователя $username!"
+            return 1
+        fi
+    fi
+}
+
+# --- ИСПРАВЛЕНО: удаление учитывает наличие userdel ---
 delUser() {
     if isRoot; then
         [ "$username" = "root" ] && return 0
         if grep -q "^$username:" /etc/passwd; then
-            deluser "$username" 2>/dev/null
+            if command -v userdel >/dev/null 2>&1; then
+                userdel "$username" 2>/dev/null
+            else
+                deluser "$username" 2>/dev/null
+            fi
             [ $? -eq 0 ] && echo " - Пользователь $username удален!" || echo " - Не удалось удалить пользователя $username!"
         else
             echo " - Пользователь $username не найден!"
@@ -75,7 +124,7 @@ uninstall() {
     echo ""
     echo " Это действие удалит все данные TorrServer включая базу данных торрентов и настройки!"
     echo ""
-    read -p " Вы уверены что хотите удалить программу? ($(colorize red Y)es/$(colorize yellow N)o) " answer_del </dev/tty
+    read -p " Вы уверены что хотите удалить программу? ($(colorize red Y)es/($(colorize yellow N)o) " answer_del </dev/tty
     if [ "$answer_del" != "${answer_del#[YyДд]}" ]; then
         cleanup
         echo " - TorrServer удален из системы!"
@@ -138,7 +187,7 @@ installTorrServer() {
     urlBin="https://github.com/YouROK/TorrServer/releases/download/MatriX.136/TorrServer-linux-arm64"
     
     echo " Загружаем TorrServer..."
-    curl -L -o "$dirInstall/$binName" "$urlBin"
+    curl -fL -o "$dirInstall/$binName" "$urlBin"
     chmod +x "$dirInstall/$binName"
     
     addUser
@@ -164,7 +213,7 @@ installTorrServer() {
         authOptions="--port $servicePort --path $dirInstall"
     fi
     
-    # Создаем init script для OpenWrt
+    # Создаем init script для OpenWrt (без изменений)
     cat << EOF > /etc/init.d/$serviceName
 #!/bin/sh /etc/rc.common
 
@@ -222,7 +271,7 @@ checkInstalled() {
 
 UpdateVersion() {
     /etc/init.d/$serviceName stop
-    curl -L -o "$dirInstall/TorrServer-linux-arm64" "https://github.com/YouROK/TorrServer/releases/download/MatriX.136/TorrServer-linux-arm64"
+    curl -fL -o "$dirInstall/TorrServer-linux-arm64" "https://github.com/YouROK/TorrServer/releases/download/MatriX.136/TorrServer-linux-arm64"
     chmod +x "$dirInstall/TorrServer-linux-arm64"
     /etc/init.d/$serviceName start
     echo " - TorrServer обновлен!"
@@ -276,8 +325,7 @@ while true; do
         [NnНн]*)
             break
             ;;
-        *) echo " Введите $(colorize green Y)es, $(colorize yellow N)o или $(colorize red D)elete"
-            ;;
+        *) echo " Введите $(colorize green Y)es, $(colorize yellow N)o или $(colorize red D)elete" ;;
     esac
 done
 
