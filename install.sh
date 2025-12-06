@@ -129,15 +129,11 @@ initialCheck() {
 
 # Получаем последний релиз TorrServer с GitHub
 getLatestRelease() {
-    echo " Определяем последнюю версию TorrServer..."
-    # Берём tag_name из API, первая строка с tag_name
+    # Только возвращаем tag_name, без лишнего вывода
     latest_tag=$(curl -s https://api.github.com/repos/YouROK/TorrServer/releases/latest 2>/dev/null | grep '"tag_name"' | head -n1 | cut -d'"' -f4)
 
     if [ -z "$latest_tag" ]; then
-        echo " - Не удалось получить последнюю версию с GitHub, используем MatriX.136 по умолчанию"
         latest_tag="MatriX.136"
-    else
-        echo " - Найдена версия: $latest_tag"
     fi
 
     echo "$latest_tag"
