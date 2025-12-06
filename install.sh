@@ -127,16 +127,8 @@ initialCheck() {
     checkInternet
 }
 
-# Получаем последний релиз TorrServer с GitHub
 getLatestRelease() {
-    # Только возвращаем tag_name, без лишнего вывода
-    latest_tag=$(curl -s https://api.github.com/repos/YouROK/TorrServer/releases/latest 2>/dev/null | grep '"tag_name"' | head -n1 | cut -d'"' -f4)
-
-    if [ -z "$latest_tag" ]; then
-        latest_tag="MatriX.136"
-    fi
-
-    echo "$latest_tag"
+    curl -s https://api.github.com/repos/YouROK/TorrServer/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
 installTorrServer() {
@@ -153,15 +145,10 @@ installTorrServer() {
     binName="TorrServer-linux-arm64"
     [ ! -d "$dirInstall" ] && mkdir -p "$dirInstall"
 
-    latest_tag=$(getLatestRelease)
-    urlBin="https://github.com/YouROK/TorrServer/releases/download/${latest_tag}/${binName}"
+    urlBin="https://github.com/YouROK/TorrServer/releases/download/MatriX.136/TorrServer-linux-arm64"
 
-    echo " Загружаем TorrServer (${latest_tag})..."
+    echo " Загружаем TorrServer..."
     curl -L -o "$dirInstall/$binName" "$urlBin"
-    if [ $? -ne 0 ]; then
-        echo " - Ошибка загрузки TorrServer по адресу $urlBin"
-        exit 1
-    fi
     chmod +x "$dirInstall/$binName"
 
     addUser
@@ -249,22 +236,9 @@ checkInstalled() {
 }
 
 UpdateVersion() {
-    if ! checkInstalled; then
-        return 1
-    fi
     /etc/init.d/$serviceName stop 2>/dev/null
-
-    binName="TorrServer-linux-arm64"
-    latest_tag=$(getLatestRelease)
-    urlBin="https://github.com/YouROK/TorrServer/releases/download/${latest_tag}/${binName}"
-
-    echo " Обновляем TorrServer до версии ${latest_tag}..."
-    curl -L -o "$dirInstall/$binName" "$urlBin"
-    if [ $? -ne 0 ]; then
-        echo " - Ошибка загрузки TorrServer по адресу $urlBin"
-        exit 1
-    fi
-    chmod +x "$dirInstall/$binName"
+    curl -L -o "$dirInstall/TorrServer-linux-arm64" "https://github.com/YouROK/TorrServer/releases/download/MatriX.136/TorrServer-linux-arm64"
+    chmod +x "$dirInstall/TorrServer-linux-arm64"
     /etc/init.d/$serviceName start
     echo " - TorrServer обновлен!"
 }
@@ -325,4 +299,3 @@ done
 
 echo " Удачи!"
 echo ""
-
