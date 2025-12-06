@@ -28,59 +28,22 @@ isRoot() {
     [ "$(id -u)" -eq 0 ] && return 0 || return 1
 }
 
-# === добавлено: гарантируем наличие группы nogroup ===
-ensureNogroup() {
-    if ! grep -q "^nogroup:" /etc/group; then
-        if command -v groupadd >/dev/null 2>&1; then
-            groupadd -g 65534 nogroup 2>/dev/null || groupadd nogroup 2>/dev/null
-        else
-            echo "nogroup:x:65534:" >> /etc/group
-        fi
-    fi
-}
-
-# === исправлено: создание пользователя работает даже без adduser/useradd ===
 addUser() {
     if isRoot; then
         [ "$username" = "root" ] && return 0
-
         if grep -q "^$username:" /etc/passwd; then
             echo " - Пользователь $username уже существует!"
-            [ -d "$dirInstall" ] || mkdir -p "$dirInstall"
-            ensureNogroup
-            chown -R "$username:nogroup" "$dirInstall"
-            chmod 755 "$dirInstall"
             return 0
-        fi
-
-        echo " - Добавляем пользователя $username..."
-        [ -d "$dirInstall" ] || mkdir -p "$dirInstall"
-        ensureNogroup
-
-        if command -v useradd >/dev/null 2>&1; then
-            useradd -r -s /bin/false -d "$dirInstall" -M -g nogroup "$username"
-            rc=$?
-        elif command -v adduser >/dev/null 2>&1; then
-            adduser -D -H -h "$dirInstall" -s /bin/false -G nogroup "$username"
-            rc=$?
         else
-            # Ручной фолбэк: корректный UID >= 1000
-            next_uid=$(awk -F: 'BEGIN{m=999} {if($3>m)m=$3} END{print (m<1000?1000:m+1)}' /etc/passwd)
-            echo "$username:x:${next_uid}:65534:$username:$dirInstall:/bin/false" >> /etc/passwd
-            if [ -f /etc/shadow ]; then
-                grep -q "^$username:" /etc/shadow 2>/dev/null || echo "$username:!*:0:0:99999:7:::" >> /etc/shadow
+            # adduser BusyBox / OpenWrt
+            adduser -h "$dirInstall" -s /bin/false "$username"
+            if [ $? -eq 0 ]; then
+                chmod 755 "$dirInstall"
+                echo " - Пользователь $username добавлен!"
+            else
+                echo " - Не удалось добавить пользователя $username!"
+                return 1
             fi
-            rc=0
-        fi
-
-        if [ $rc -eq 0 ] && grep -q "^$username:" /etc/passwd; then
-            chmod 755 "$dirInstall"
-            chown -R "$username:nogroup" "$dirInstall"
-            echo " - Пользователь $username добавлен и назначен владельцем $dirInstall"
-            return 0
-        else
-            echo " - Не удалось добавить пользователя $username!"
-            return 1
         fi
     fi
 }
@@ -89,18 +52,8 @@ delUser() {
     if isRoot; then
         [ "$username" = "root" ] && return 0
         if grep -q "^$username:" /etc/passwd; then
-            if command -v userdel >/dev/null 2>&1; then
-                userdel "$username" 2>/dev/null
-                rc=$?
-            elif command -v deluser >/dev/null 2>&1; then
-                deluser "$username" 2>/dev/null
-                rc=$?
-            else
-                sed -i "\|^$username:|d" /etc/passwd
-                [ -f /etc/shadow ] && sed -i "\|^$username:|d" /etc/shadow
-                rc=0
-            fi
-            [ $rc -eq 0 ] && echo " - Пользователь $username удален!" || echo " - Не удалось удалить пользователя $username!"
+            deluser "$username" 2>/dev/null
+            [ $? -eq 0 ] && echo " - Пользователь $username удален!" || echo " - Не удалось удалить пользователя $username!"
         else
             echo " - Пользователь $username не найден!"
             return 1
@@ -112,8 +65,17 @@ checkRunning() {
     pidof TorrServer-linux-arm64 | head -n 1
 }
 
+# Берём стабильный LAN-адрес роутера, а не WAN
 getIP() {
-    ip addr show dev "$(ip route | grep default | awk '{print $5}')" | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n 1
+    # Сначала пробуем взять IP из UCI
+    lan_ip=$(uci -q get network.lan.ipaddr)
+    if [ -n "$lan_ip" ]; then
+        echo "$lan_ip"
+        return 0
+    fi
+
+    # Fallback: пробуем br-lan
+    ip addr show dev br-lan 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n 1
 }
 
 uninstall() {
@@ -165,13 +127,25 @@ initialCheck() {
     checkInternet
 }
 
+# Получаем последний релиз TorrServer с GitHub
 getLatestRelease() {
-    curl -s https://api.github.com/repos/YouROK/TorrServer/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+    echo " Определяем последнюю версию TorrServer..."
+    # Берём tag_name из API, первая строка с tag_name
+    latest_tag=$(curl -s https://api.github.com/repos/YouROK/TorrServer/releases/latest 2>/dev/null | grep '"tag_name"' | head -n1 | cut -d'"' -f4)
+
+    if [ -z "$latest_tag" ]; then
+        echo " - Не удалось получить последнюю версию с GitHub, используем MatriX.136 по умолчанию"
+        latest_tag="MatriX.136"
+    else
+        echo " - Найдена версия: $latest_tag"
+    fi
+
+    echo "$latest_tag"
 }
 
 installTorrServer() {
     echo " Устанавливаем и настраиваем TorrServer..."
-    
+
     if [ -f "$dirInstall/TorrServer-linux-arm64" ]; then
         read -p " TorrServer уже установлен. Хотите обновить? ($(colorize green Y)es/$(colorize yellow N)o) " answer_up </dev/tty
         if [ "$answer_up" != "${answer_up#[YyДд]}" ]; then
@@ -182,15 +156,20 @@ installTorrServer() {
 
     binName="TorrServer-linux-arm64"
     [ ! -d "$dirInstall" ] && mkdir -p "$dirInstall"
-    
-    urlBin="https://github.com/YouROK/TorrServer/releases/download/MatriX.136/TorrServer-linux-arm64"
-    
-    echo " Загружаем TorrServer..."
+
+    latest_tag=$(getLatestRelease)
+    urlBin="https://github.com/YouROK/TorrServer/releases/download/${latest_tag}/${binName}"
+
+    echo " Загружаем TorrServer (${latest_tag})..."
     curl -L -o "$dirInstall/$binName" "$urlBin"
+    if [ $? -ne 0 ]; then
+        echo " - Ошибка загрузки TorrServer по адресу $urlBin"
+        exit 1
+    fi
     chmod +x "$dirInstall/$binName"
-    
-    addUser || { echo " - Ошибка создания пользователя"; exit 1; }
-    
+
+    addUser
+
     read -p " Хотите изменить порт для TorrServer (по умолчанию 8090)? ($(colorize yellow Y)es/$(colorize green N)o) " answer_cp </dev/tty
     if [ "$answer_cp" != "${answer_cp#[YyДд]}" ]; then
         read -p " Введите номер порта: " answer_port </dev/tty
@@ -198,21 +177,23 @@ installTorrServer() {
     else
         servicePort="8090"
     fi
-    
+
     read -p " Включить авторизацию на сервере? ($(colorize green Y)es/$(colorize yellow N)o) " answer_auth </dev/tty
+    isAuthUser=""
+    isAuthPass=""
     if [ "$answer_auth" != "${answer_auth#[YyДд]}" ]; then
         read -p " Пользователь: " answer_user </dev/tty
         isAuthUser=$answer_user
         read -p " Пароль: " answer_pass </dev/tty
         isAuthPass=$answer_pass
-        umask 077
+        echo " Сохраняем $isAuthUser:$isAuthPass в ${dirInstall}/accs.db"
         echo -e "{\n  \"$isAuthUser\": \"$isAuthPass\"\n}" > "$dirInstall/accs.db"
         authOptions="--port $servicePort --path $dirInstall --httpauth"
     else
         authOptions="--port $servicePort --path $dirInstall"
     fi
-    
-    # Создаем init script для OpenWrt (добавлен запуск НЕ от root)
+
+    # Создаем init script для OpenWrt
     cat << EOF > /etc/init.d/$serviceName
 #!/bin/sh /etc/rc.common
 
@@ -221,12 +202,13 @@ STOP=10
 
 USE_PROCD=1
 PROG="$dirInstall/TorrServer-linux-arm64"
+USER="$username"
 
 start_service() {
     procd_open_instance
     procd_set_param command \$PROG $authOptions
-    procd_set_param user "$username"
-    procd_set_param group "nogroup"
+    # Если пользователь не root — запускаем от него
+    [ "\$USER" != "root" ] && procd_set_param user "\$USER"
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -234,7 +216,7 @@ start_service() {
 }
 
 stop_service() {
-    killall TorrServer-linux-arm64
+    killall TorrServer-linux-arm64 2>/dev/null
 }
 
 reload_service() {
@@ -246,9 +228,9 @@ EOF
     chmod +x /etc/init.d/$serviceName
     /etc/init.d/$serviceName enable
     /etc/init.d/$serviceName start
-    
+
     serverIP=$(getIP)
-    
+
     echo ""
     echo " TorrServer установлен в директории ${dirInstall}"
     echo ""
@@ -271,9 +253,22 @@ checkInstalled() {
 }
 
 UpdateVersion() {
-    /etc/init.d/$serviceName stop
-    curl -L -o "$dirInstall/TorrServer-linux-arm64" "https://github.com/YouROK/TorrServer/releases/download/MatriX.136/TorrServer-linux-arm64"
-    chmod +x "$dirInstall/TorrServer-linux-arm64"
+    if ! checkInstalled; then
+        return 1
+    fi
+    /etc/init.d/$serviceName stop 2>/dev/null
+
+    binName="TorrServer-linux-arm64"
+    latest_tag=$(getLatestRelease)
+    urlBin="https://github.com/YouROK/TorrServer/releases/download/${latest_tag}/${binName}"
+
+    echo " Обновляем TorrServer до версии ${latest_tag}..."
+    curl -L -o "$dirInstall/$binName" "$urlBin"
+    if [ $? -ne 0 ]; then
+        echo " - Ошибка загрузки TorrServer по адресу $urlBin"
+        exit 1
+    fi
+    chmod +x "$dirInstall/$binName"
     /etc/init.d/$serviceName start
     echo " - TorrServer обновлен!"
 }
@@ -326,9 +321,12 @@ while true; do
         [NnНн]*)
             break
             ;;
-        *) echo " Введите $(colorize green Y)es, $(colorize yellow N)o или $(colorize red D)elete" ;;
+        *)
+            echo " Введите $(colorize green Y)es, $(colorize yellow N)o или $(colorize red D)elete"
+            ;;
     esac
 done
 
 echo " Удачи!"
 echo ""
+
